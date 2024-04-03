@@ -1,6 +1,6 @@
 /*
    Copyright (c) 2003, 2023, Oracle and/or its affiliates.
-   Copyright (c) 2021, 2023, Hopsworks and/or its affiliates.
+   Copyright (c) 2021, 2024, Hopsworks and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -13508,6 +13508,15 @@ void Dblqh::execCOMMIT(Signal* signal)
     }
     return;
   }
+  if (ERROR_INSERTED(5110))
+  {
+    jam();
+    g_eventLogger->info("LQH %u delaying commit",
+                        instance());
+    sendSignalWithDelay(cownref, GSN_COMMIT, signal, 200, signal->getLength());
+    return;
+  }
+
   ndbassert(m_fragment_lock_status == FRAGMENT_UNLOCKED);
   if (likely((tcConnectptr.p->transid[0] == transid1) &&
              (tcConnectptr.p->transid[1] == transid2)))
@@ -13704,6 +13713,14 @@ void Dblqh::execCOMPLETE(Signal* signal)
       sendSignal(numberToRef(CMVMI, refToNode(save)),
                  GSN_NDB_TAMPER, signal, 1, JBB);
     }
+    return;
+  }
+  if (ERROR_INSERTED(5111))
+  {
+    jam();
+    g_eventLogger->info("LQH %u delaying complete",
+                        instance());
+    sendSignalWithDelay(cownref, GSN_COMPLETE, signal, 200, signal->getLength());
     return;
   }
   ndbassert(m_fragment_lock_status == FRAGMENT_UNLOCKED);
@@ -16396,7 +16413,6 @@ void Dblqh::lqhTransNextLab(Signal* signal,
       else
       {
 #if defined VM_TRACE || defined ERROR_INSERT
-        jam();
         ndbrequire(tcConnectptr.p->tcScanRec == RNIL);
 #endif
       }
@@ -16404,7 +16420,6 @@ void Dblqh::lqhTransNextLab(Signal* signal,
     else
     {
 #if defined VM_TRACE || defined ERROR_INSERT
-      jam();
       ndbrequire(tcConnectptr.p->tcScanRec == RNIL);
 #endif
     }
@@ -16442,7 +16457,6 @@ Dblqh::scanMarkers(Signal* signal,
   const Uint32 RT_BREAK = 128;
   for (Uint32 i = 0; i < RT_BREAK; i++)
   {
-    jam();
     CommitAckMarkerPtr commitAckMarkerPtr;
     bool found = getNextCommitAckMarker(commitAckMarkerPtrI,
                                         commitAckMarkerPtr,
@@ -16494,7 +16508,6 @@ Dblqh::scanMarkers(Signal* signal,
 		 signal, LqhTransConf::SignalLength, JBB);
       return;
     }
-    jam();
   }
   
   signal->theData[0] = ZSCAN_MARKERS;
@@ -24884,11 +24897,19 @@ void Dblqh::execBACKUP_FRAGMENT_CONF(Signal* signal)
 {
   jamEntry();
 
-  if (ERROR_INSERTED(5073))
+  if (ERROR_INSERTED(5073) || ERROR_INSERTED(5109))
   {
     g_eventLogger->info("Delaying BACKUP_FRAGMENT_CONF");
     sendSignalWithDelay(reference(), GSN_BACKUP_FRAGMENT_CONF, signal, 500,
                         signal->getLength());
+    /**
+     * If an ALTER table is ongoing the error 5109 is removed to makes tup to
+     * commit the alter table
+     */
+    if(ERROR_INSERTED(5109) && handleLCPSurfacing(signal))
+    {
+      CLEAR_ERROR_INSERT_VALUE;
+    }
     return;
   }
 
@@ -28984,7 +29005,8 @@ void Dblqh::execSTART_FRAGREQ(Signal* signal)
   Uint32 fragId = startFragReq->fragId;
 
   ptrCheckGuard(tabptr, ctabrecFileSize, tablerec);
-  if (!getFragmentrec(fragId)) {
+  if (!getFragmentrec(fragId))
+  {
     startFragRefLab(signal);
     return;
   }//if
@@ -29015,7 +29037,7 @@ void Dblqh::execSTART_FRAGREQ(Signal* signal)
   /**
    * Always printSTART_FRAG_REQ (for debugging) if ERROR_INSERT is set
    */
-  doprint = true;
+  doprint = false;
 #endif
 #ifdef DEBUG_LCP
   doprint = true;
@@ -39596,11 +39618,32 @@ Dblqh::checkLcpFragWatchdog(Signal* signal)
     Uint32 max_no_progress_time =
       c_lcpFragWatchdog.MaxElapsedWithNoProgressMillis;
 
-    if ((c_lcpFragWatchdog.lcpState == LcpStatusConf::LCP_WAIT_END_LCP) &&
-        (max_no_progress_time < c_lcpFragWatchdog.MaxGcpWaitLimitMillis))
+    if (c_lcpFragWatchdog.lcpState == LcpStatusConf::LCP_WAIT_END_LCP)
     {
       jam();
-      max_no_progress_time = c_lcpFragWatchdog.MaxGcpWaitLimitMillis;
+      /**
+       * In WAIT_END_LCP state we have a dependency on GCP completion
+       * We will therefore extend the allowed duration so that GCP
+       * related issues do not result in LCP shutdown
+       */
+      if (c_lcpFragWatchdog.MaxGcpWaitLimitMillis == 0)
+      {
+        jam();
+        /**
+         * No GCP limit set, therefore LCP should not time out in
+         * WAIT_END_LCP state.
+         */
+        max_no_progress_time = 0;
+      }
+      else if (max_no_progress_time < c_lcpFragWatchdog.MaxGcpWaitLimitMillis)
+      {
+        jam();
+        /**
+         * GCP limit set which is larger than LCP limit, extend
+         * LCP limit to cover it
+         */
+        max_no_progress_time = c_lcpFragWatchdog.MaxGcpWaitLimitMillis;
+      }
     }
 
     char buf2[512];
@@ -39624,11 +39667,12 @@ Dblqh::checkLcpFragWatchdog(Signal* signal)
       g_eventLogger->info("%s", buf2);
     }
 
-    if (c_lcpFragWatchdog.elapsedNoProgressMillis >= max_no_progress_time)
+    if ((max_no_progress_time > 0) &&
+        (c_lcpFragWatchdog.elapsedNoProgressMillis >= max_no_progress_time))
     {
       jam();
       /* Too long with no progress... */
-      warningEvent("Waited too long with  LCP not progressing.");
+      warningEvent("Waited too long with LCP not progressing.");
       g_eventLogger->info("Waited too long with LCP not progressing.");
 
       /**

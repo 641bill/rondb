@@ -1,6 +1,6 @@
 /*
    Copyright (c) 2003, 2023, Oracle and/or its affiliates.
-   Copyright (c) 2021, 2023, Hopsworks and/or its affiliates.
+   Copyright (c) 2021, 2024, Hopsworks and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -513,6 +513,16 @@ Configuration::get_schema_memory(ndb_mgm_configuration_iterator *p,
   ndb_mgm_get_int_parameter(p, CFG_LQH_FRAG, &num_fragments);
   Uint32 num_tot_fragments = 0;
   ndb_mgm_get_int_parameter(p, CFG_DIH_FRAG_CONNECT, &num_tot_fragments);
+
+  Uint32 noOfNodes = 0;
+  Uint32 noOfDBNodes = 0;
+  Uint32 noOfAPINodes = 0;
+  Uint32 noOfMGMNodes = 0;
+  get_num_nodes(noOfNodes,
+                noOfDBNodes,
+                noOfAPINodes,
+                noOfMGMNodes);
+
   Uint32 num_triggers = globalData.theMaxNoOfTriggers;
   Uint32 num_attributes = globalData.theMaxNoOfAttributes;
   Uint32 num_tables = globalData.theMaxNoOfTables;
@@ -528,7 +538,10 @@ Configuration::get_schema_memory(ndb_mgm_configuration_iterator *p,
                              Uint64(num_ordered_indexes) +
                              Uint64(num_unique_hash_indexes);
   Uint64 num_replica_records =
-    num_table_objects * (partitions_per_node + 1) * num_replicas;
+    num_table_objects *
+    partitions_per_node *
+    num_replicas *
+    noOfDBNodes;
   Uint64 num_ldm_threads = Uint64(globalData.ndbMtLqhWorkers);
   Uint64 num_tc_threads = Uint64(globalData.ndbMtTcWorkers);
 
@@ -555,7 +568,8 @@ Configuration::get_schema_memory(ndb_mgm_configuration_iterator *p,
   Uint64 dict_table_mem =
     Dbdict::getTableRecordSize() * num_table_objects;
   Uint64 dict_obj_mem =
-    (Dbdict::getDictObjectRecordSize() + 8) * (num_table_objects + num_triggers);
+    (Dbdict::getDictObjectRecordSize() + 8) *
+    (num_table_objects + num_triggers);
   Uint64 dict_key_descriptor_mem =
     sizeof(struct KeyDescriptor) * num_table_objects;
 
@@ -814,12 +828,14 @@ Configuration::get_schema_memory(ndb_mgm_configuration_iterator *p,
   if (config_schema_memory != 0)
   {
     globalData.theSchemaMemory = config_schema_memory;
+    globalData.theExtraSchemaMemory = 0;
   }
   else
   {
     schema_memory = schema_mem_block - table_mem;
     schema_memory += map_size;
-    globalData.theSchemaMemory = schema_memory;
+    globalData.theSchemaMemory = schema_memory / 4;
+    globalData.theExtraSchemaMemory = schema_memory / 4;
   }
 }
 
@@ -1322,8 +1338,7 @@ Configuration::calculate_automatic_memory(ndb_mgm_configuration_iterator *p,
   }
   Uint64 table_memory = 0;
   get_schema_memory(p, table_memory);
-  Uint64 compute_schema_memory = globalData.theSchemaMemory;
-  Uint64 schema_memory = compute_schema_memory / 4;
+  Uint64 schema_memory = globalData.theSchemaMemory;
 
   Uint64 compute_backup_schema_memory = get_backup_schema_memory(p);
   Uint64 backup_schema_memory = compute_backup_schema_memory / 4;
@@ -1352,7 +1367,7 @@ Configuration::calculate_automatic_memory(ndb_mgm_configuration_iterator *p,
   Uint64 shared_global_memory = get_and_set_shared_global_memory(p);
   Uint64 extra_shared_global_memory = 0;
   extra_shared_global_memory += (compute_backup_schema_memory / 4);
-  extra_shared_global_memory += compute_schema_memory / 4;
+  extra_shared_global_memory += globalData.theExtraSchemaMemory;
   extra_shared_global_memory += (compute_job_buffer / 4);
   extra_shared_global_memory += (compute_send_buffer / 2);
   shared_global_memory += extra_shared_global_memory;
@@ -2113,6 +2128,7 @@ Configuration::calcSizeAlt(ConfigValues * ownConfig)
   unsigned int partitionsPerNode = 2;
   unsigned int automaticThreadConfig = 1;
   unsigned int automaticMemoryConfig = 1;
+  unsigned int max_schema_objects = OLD_NDB_MAX_TABLES;
 
   m_logLevel = new LogLevel();
   if (!m_logLevel)
@@ -2127,6 +2143,7 @@ Configuration::calcSizeAlt(ConfigValues * ownConfig)
     { CFG_DB_NO_LOCAL_SCANS, &noOfLocalScanRecords, true },
     { CFG_DB_RESERVED_LOCAL_SCANS, &reservedLocalScanRecords, true },
     { CFG_DB_BATCH_SIZE, &noBatchSize, false },
+    { CFG_DB_MAX_NUM_SCHEMA_OBJECTS, &max_schema_objects, false },
     { CFG_DB_NO_TABLES, &noOfTables, false },
     { CFG_DB_NO_ORDERED_INDEXES, &noOfOrderedIndexes, false },
     { CFG_DB_NO_UNIQUE_HASH_INDEXES, &noOfUniqueHashIndexes, false },
@@ -2258,6 +2275,24 @@ Configuration::calcSizeAlt(ConfigValues * ownConfig)
     g_eventLogger->info("MaxNoOfTriggers set to %u", noOfTriggers);
   }
 
+  
+  if (max_schema_objects < noOfMetaTables)
+  {
+    char reason_msg[256];
+    const char *msg = "Schema File Error";
+    BaseString::snprintf(reason_msg, sizeof(reason_msg),
+      "Trying to start with less schema objects than table objects"
+      ", started with %u table objects and a maximum of %u"
+      " schema objects in schema file, increase"
+      " MaxNoOfSchemaObjects",
+      noOfMetaTables,
+      max_schema_objects);
+    ERROR_SET(fatal,
+              NDBD_EXIT_SR_SCHEMAFILE,
+              msg,
+              reason_msg);
+  }
+
   /**
    * Do size calculations
    */
@@ -2270,9 +2305,6 @@ Configuration::calcSizeAlt(ConfigValues * ownConfig)
   cfg.put(CFG_TUP_NO_TRIGGERS, noOfTriggers + 3 * noOfMetaTables);
 
   Uint32 noOfMetaTablesDict= noOfMetaTables;
-  if (noOfMetaTablesDict > NDB_MAX_TABLES)
-    noOfMetaTablesDict= NDB_MAX_TABLES;
-
   {
     /**
      * Dict Size Alt values
@@ -2393,9 +2425,12 @@ Configuration::calcSizeAlt(ConfigValues * ownConfig)
       automaticThreadConfig == 1)
   {
     numFragmentsPerNodePerLdm =
-      (partitionsPerNode + 1) * noOfMetaTables * noOfReplicas / ldmInstances;
-    noFragPerTable= (noOfDBNodes * (partitionsPerNode + 1));
-    numReplicas = noOfMetaTables * (partitionsPerNode + 1) * noOfReplicas;
+      partitionsPerNode * noOfMetaTables * noOfReplicas / ldmInstances;
+    noFragPerTable= (noOfDBNodes * partitionsPerNode);
+    numReplicas = noOfMetaTables *
+                  partitionsPerNode *
+                  noOfReplicas *
+                  noOfDBNodes;
   }
   else
   {

@@ -1721,17 +1721,17 @@ BackupRestore::update_apply_status(const RestoreMetaData &metaData, bool snapsho
       return false;
     }
     if (op->writeTuple() ||
-        op->equal(0u, (const char *)&server_id, sizeof(server_id)) ||
-        op->setValue(1u, (const char *)&epoch, sizeof(epoch)))
+        op->equal(0u, server_id) ||
+        op->setValue(1u, epoch))
     {
       restoreLogger.log_error("%s : failed to set epoch value in --restore-epoch: %u:%s",
           NDB_APPLY_TABLE, op->getNdbError().code, op->getNdbError().message);
       return false;
     }
     if ((apply_table_format == 2) &&
-        (op->setValue(2u, (const char *)&empty_string, 1) ||
-         op->setValue(3u, (const char *)&zero, sizeof(zero)) ||
-         op->setValue(4u, (const char *)&zero, sizeof(zero))))
+        (op->setValue(2u, empty_string) ||
+         op->setValue(3u, zero) ||
+         op->setValue(4u, zero)))
     {
       restoreLogger.log_error("%s : failed to set values in --restore-epoch: %u:%s",
           NDB_APPLY_TABLE, op->getNdbError().code, op->getNdbError().message);
@@ -1819,7 +1819,7 @@ BackupRestore::delete_epoch_tuple()
 
     Uint32 server_id= 0;
     if (op->deleteTuple() ||
-        op->equal(0u, (const char *)&server_id, sizeof(server_id)))
+        op->equal(0u, server_id))
     {
       restoreLogger.log_error("%s : failed to delete tuple with server_id=0 in --with-apply-status: %u: %s",
           NDB_APPLY_TABLE, op->getNdbError().code, op->getNdbError().message);
@@ -2222,6 +2222,8 @@ BackupRestore::check_blobs(TableS & tableS)
   return true;
 }
 
+// BackupRestore::table_compatible_check will always call
+// restoreLogger.log_error before returning false.
 bool
 BackupRestore::table_compatible_check(TableS & tableS)
 {
@@ -2243,27 +2245,66 @@ BackupRestore::table_compatible_check(TableS & tableS)
   const NdbTableImpl & tmptab = NdbTableImpl::getImpl(* tableS.m_dictTable);
   if ((int) tmptab.m_indexType != (int) NdbDictionary::Index::Undefined)
   {
-    if((int) tmptab.m_indexType == (int) NdbDictionary::Index::UniqueHashIndex)
+    if((int) tmptab.m_indexType != (int) NdbDictionary::Index::UniqueHashIndex)
+      return true;
+
+    // We now know that tablename refers to a unique hash index in the backup.
+    // Find out whether this unique hash index exists in the database.
+    const char *index_qualified_name = tablename;
+    const char *table_qualified_name = tmptab.m_primaryTable.c_str();
+    BaseString index_db_name, index_schema_name, index_name, table_db_name, table_schema_name, table_name;
+    if (!dissect_index_name(index_qualified_name, index_db_name, index_schema_name, index_name))
+      return false;
+    if (!dissect_table_name(table_qualified_name, table_db_name, table_schema_name, table_name))
+      return false;
+    if(strcmp(index_db_name.c_str(), "sys") != 0)
     {
-      BaseString dummy1, dummy2, indexname;
-      dissect_index_name(tablename, dummy1, dummy2, indexname);
+      restoreLogger.log_error("Error: Expected index %s to belong to database sys.",
+                              index_qualified_name);
+      return false;
+    }
+    if(strcmp(index_schema_name.c_str(), "def") != 0)
+    {
+      restoreLogger.log_error("Error: Expected index %s to belong to schema def.",
+                              index_qualified_name);
+      return false;
+    }
+    if(strcmp(table_schema_name.c_str(), "def") != 0)
+    {
+      restoreLogger.log_error("Error: Expected table %s to belong to schema def.",
+                              table_qualified_name);
+      return false;
+    }
+    check_rewrite_database(table_db_name);
+    m_ndb->setDatabaseName(table_db_name.c_str());
+    m_ndb->setSchemaName(table_schema_name.c_str());
+    NdbDictionary::Dictionary* dict = m_ndb->getDictionary();
+    const NdbDictionary::Index* indexTab = dict->getIndex(index_name.c_str(), table_name.c_str());
+    bool index_exists_in_db = indexTab != 0;
+    // End of finding out whether index exists in database
+
+    // If we are restoring data into a database where a unique index exists, we
+    // might have a problem. We have already checked that we are restoring data.
+    if(index_exists_in_db)
+    {
       if(ga_allow_unique_indexes)
       {
-        restoreLogger.log_error( "WARNING: Table %s contains unique index %s."
-             "This can cause ndb_restore failures with duplicate key errors "
-             "while restoring data. To avoid duplicate key errors, use "
-             "--disable-indexes before restoring data and --rebuild-indexes "
-             "after data is restored.",
-             tmptab.m_primaryTable.c_str(), indexname.c_str());
+        restoreLogger.log_error( "WARNING: Table %s.%s contains unique index "
+            "%s. This can cause ndb_restore to fail with duplicate key errors "
+            "while restoring data. To avoid duplicate key errors, use "
+            "--disable-indexes before or when restoring data and "
+            "--rebuild-indexes after or when restoring data. Will continue due "
+            "to --allow-unique-indexes being set.",
+            table_db_name.c_str(), table_name.c_str(), index_name.c_str());
       }
       else
       {
-        restoreLogger.log_error( "ERROR: Refusing to restore because table %s "
-             "contains unique index %s. Use --disable-indexes before "
-             "restoring data and --rebuild-indexes after data is restored. "
-             "Optionally, and with risk of causing duplicate key errors while "
-             "restoring, you can use --allow-unique-indexes instead.",
-             tmptab.m_primaryTable.c_str(), indexname.c_str());
+        restoreLogger.log_error( "ERROR: Refusing to restore because table "
+            "%s.%s contains unique index %s. Use --disable-indexes before or "
+            "when restoring data and --rebuild-indexes after or when restoring "
+            "data. Optionally, and with risk of causing duplicate key errors "
+            "while restoring, you can use --allow-unique-indexes instead.",
+            table_db_name.c_str(), table_name.c_str(), index_name.c_str());
         return false;
       }
     }
@@ -2527,7 +2568,7 @@ BackupRestore::table_compatible_check(TableS & tableS)
            (col_in_kernel->getDefaultValue() == NULL)))
       {
         restoreLogger.log_error( "Missing column(%s.%s) in backup "
-            " is primary key or not nullable or defaulted in DB",
+            "is primary key or not nullable or defaulted in DB",
             tableS.m_dictTable->getName(), col_in_kernel->getName());
         return false;
       }
@@ -3222,7 +3263,7 @@ BackupRestore::fk(Uint32 type, const void * ptr)
   if (!m_restore_meta && !m_rebuild_indexes && !m_disable_indexes)
     return true;
 
-  // only record FKs, create in endOfTables()
+  // only record FKs, create in endOfTablesFK()
   switch (type){
   case DictTabInfo::ForeignKey:
   {
@@ -3423,10 +3464,27 @@ BackupRestore::endOfTables(){
 }
 
 bool
-BackupRestore::endOfTablesFK()
+BackupRestore::endOfTablesFK(bool at_rebuild)
 {
-  if (!m_restore_meta && !m_rebuild_indexes && !m_disable_indexes)
-    return true;
+  /*
+   * BackupConsumer::endOfTablesFK is called in two situations:
+   * 1) As part of metadata restore, before any data restore has begun, with
+   *    argument at_rebuild==false. Will only be called in this way if neither
+   *    --disable-indexes nor --rebuild-indexes is set. In this case,
+   *    we only want to create foreign keys on thread 1, and only if
+   *    --restore-meta is set. These two conditions are ensured by testing
+   *    m_restore_meta.
+   */
+  if (!at_rebuild && !m_restore_meta)
+      return true;
+  /*
+   * 2) At the end of the restore process, when no more data is to be restored,
+   *    with argument at_rebuild==true. Will only be called in this way if
+   *    --rebuild-indexes is set. In this case, we only want to create foreign
+   *    keys on the last thread. This is ensured by testing m_rebuild_indexes.
+ */
+  if (at_rebuild && !m_rebuild_indexes)
+      return true;
 
   NdbDictionary::Dictionary* dict = m_ndb->getDictionary();
   restoreLogger.log_info("Create foreign keys");
@@ -3910,15 +3968,15 @@ void BackupRestore::tuple_a(restore_callback_t *cb)
 	if (col_pk_in_kernel)
 	{
 	  if (j == 1) continue;
-	  ret = op->equal(attr_desc->attrId, dataPtr, length);
+	  ret = op->equal(attr_desc->attrId, dataPtr);
 	}
 	else
 	{
 	  if (j == 0) continue;
 	  if (attr_data->null) 
-	    ret = op->setValue(attr_desc->attrId, NULL, 0);
+	    ret = op->setValue(attr_desc->attrId, nullptr);
 	  else
-	    ret = op->setValue(attr_desc->attrId, dataPtr, length);
+	    ret = op->setValue(attr_desc->attrId, dataPtr);
 	}
 	if (ret < 0) {
 	  ndbout_c("Column: %d type %d %d %d %d",i,
@@ -4575,7 +4633,6 @@ BackupRestore::logEntry_a(restore_callback_t *cb)
   }
 
 retry:
-  Uint32 mapping_idx_key_count = 0;
 #ifdef ERROR_INSERT
   if (m_error_insert == NDB_RESTORE_ERROR_INSERT_FAIL_REPLAY_LOG && m_logCount == 25)
   {
@@ -4672,24 +4729,25 @@ retry:
       op->setPartitionId(tup.m_frag_id);
   }
 
-  Bitmask<4096> keys;
+  Bitmask<MAXNROFATTRIBUTESINWORDS> keys;
   for (Uint32 pass= 0; pass < 2; pass++)  // Keys then Values
   {
+    Uint32 mapping_idx_key_count = 0;
     for (Uint32 i= 0; i < tup.size(); i++)
     {
       const AttributeS * attr = tup[i];
-      int size = attr->Desc->size;
-      int arraySize = attr->Desc->arraySize;
+      const int size = attr->Desc->size;
+      const int arraySize = attr->Desc->arraySize;
       const char * dataPtr = attr->Data.string_value;
       const bool col_pk_in_backup = attr->Desc->m_column->getPrimaryKey();
 
       if (attr->Desc->m_exclude)
         continue;
 
-      const bool col_pk_in_kernel =
-        table->getColumn(attr->Desc->attrId)->getPrimaryKey();
+      const Uint32 attrId = attr->Desc->attrId;
+      const bool col_pk_in_kernel = table->getColumn(attrId)->getPrimaryKey();
       bool col_is_key = col_pk_in_kernel;
-      Uint32 keyAttrId = attr->Desc->attrId;
+      Uint32 keyAttrId = attrId;
 
       if (unlikely(use_mapping_idx))
       {
@@ -4718,7 +4776,7 @@ retry:
 
       /* Check for unsupported PK update */
       if (unlikely(!col_pk_in_backup && col_pk_in_kernel))
-     {
+      {
         if (unlikely(tup.m_type == LogEntry::LE_UPDATE))
         {
           if ((m_tableChangesMask & TCM_IGNORE_EXTENDED_PK_UPDATES) != 0)
@@ -4747,8 +4805,9 @@ retry:
             return;
           }
         }
-     }
-      if (tup.m_table->have_auto_inc(attr->Desc->attrId))
+      }
+
+      if (tup.m_table->have_auto_inc(attrId))
       {
         Uint64 usedAutoVal = extract_auto_val(dataPtr,
                                               size * arraySize,
@@ -4790,10 +4849,17 @@ retry:
       {
         assert(pass == 0);
 
-        if(!keys.get(keyAttrId))
+        if (!keys.get(attrId))
         {
-          keys.set(keyAttrId);
-          check= op->equal(keyAttrId, dataPtr, length);
+          keys.set(attrId);
+          check= op->equal(keyAttrId, dataPtr);
+        }
+        else if (tup.m_type == LogEntry::LE_UPDATE)
+        {
+          // If an LE_UPDATE entry contains the same 'key' twice,
+          // the second log entry is an update of the value.
+          // (As we request only changed values in the triggers)
+          check= op->setValue(attrId, dataPtr);
         }
       }
       else
@@ -4801,7 +4867,7 @@ retry:
         assert(pass == 1);
         if (tup.m_type != LogEntry::LE_DELETE)
         {
-          check= op->setValue(attr->Desc->attrId, dataPtr, length);
+          check= op->setValue(attrId, dataPtr);
         }
       }
 

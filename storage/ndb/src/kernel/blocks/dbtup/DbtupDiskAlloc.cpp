@@ -1,6 +1,6 @@
 /*
    Copyright (c) 2005, 2023, Oracle and/or its affiliates.
-   Copyright (c) 2021, 2023, Hopsworks and/or its affiliates.
+   Copyright (c) 2021, 2024, Hopsworks and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -32,6 +32,7 @@
 #define JAM_FILE_ID 426
 
 #if (defined(VM_TRACE) || defined(ERROR_INSERT))
+//#define DEBUG_REORG 1
 //#define DEBUG_UNDO_SPLIT 1
 //#define DEBUG_LCP 1
 //#define DEBUG_PGMAN_IO 1
@@ -43,6 +44,12 @@
 //#define DEBUG_UNDO_LCP 1
 //#define DEBUG_UNDO_ALLOC 1
 //#define DEBUG_FREE_SPACE 1
+#endif
+
+#ifdef DEBUG_REORG
+#define DEB_REORG(arglist) do { g_eventLogger->info arglist ; } while (0)
+#else
+#define DEB_REORG(arglist) do { } while (0)
 #endif
 
 #ifdef DEBUG_FREE_SPACE
@@ -202,11 +209,15 @@ Dbtup::printPtr(EventLogger *logger, const char *msg, int idx,
       " m_extent_no: %u"
       " m_free_space: %u"
       " m_free_matrix_pos: %u"
-      " m_free_page_count: [",
+      " m_free_page_count: [%u,%u,%u,%u]",
       msg, idx, ptr.i, printLocal_Key(buf, MAX_LOG_MESSAGE_SIZE, ptr.p->m_key),
       ptr.p->m_first_page_no, ptr.p->m_empty_page_no, ptr.p->m_key.m_file_no,
       ptr.p->m_key.m_page_no, ptr.p->m_extent_no, ptr.p->m_free_space,
-      ptr.p->m_free_matrix_pos);
+      ptr.p->m_free_matrix_pos,
+      ptr.p->m_free_page_count[0],
+      ptr.p->m_free_page_count[1],
+      ptr.p->m_free_page_count[2],
+      ptr.p->m_free_page_count[3]);
 }
 
 void 
@@ -2001,6 +2012,7 @@ Dbtup::disk_page_free(Signal *signal,
   Uint64 lsn;
   if ((tabPtrP->m_bits & Tablerec::TR_UseVarSizedDiskData) == 0)
   {
+    jamDebug();
     sz = 1;
     const Uint32 *src= ((Fix_page*)pagePtr.p)->get_ptr(page_idx, 0);
     if (!((*(src + 1)) < Tup_page::DATA_WORDS))
@@ -2043,6 +2055,24 @@ Dbtup::disk_page_free(Signal *signal,
     Uint32 new_undo_len = size_len + (sz - 1);
     jamDataDebug(new_undo_len);
     jamDataDebug(undo_len);
+    DEB_REORG(("(%u)REORG: tab(%u,%u), row_id(%u,%u), key(%u,%u,%u)"
+               ", new_undo_len: %u, undo_len: %u, sz: %u, size_len: %u"
+               ", diskPagePtrI: %u, diskPageNo: %u",
+               instance(),
+               fragPtrP->fragTableId,
+               fragPtrP->fragmentId,
+               row_id->m_page_no,
+               row_id->m_page_idx,
+               key->m_file_no,
+               key->m_page_no,
+               key->m_page_idx,
+               new_undo_len,
+               undo_len,
+               sz,
+               size_len,
+               pagePtr.i,
+               ((Var_page*)pagePtr.p)->m_page_no));
+
     /**
      * We allocate 1 extra word per kByte, thus we should have at
      * least new_undo_len words, but at most new_undo_len + 32
@@ -2121,7 +2151,8 @@ Dbtup::disk_page_free(Signal *signal,
                   used,
                   old_free,
                   new_free));
-  Int32 change = new_free - used;
+  Int32 change = ((tabPtrP->m_bits & Tablerec::TR_UseVarSizedDiskData) == 0) ?
+                 1 : new_free - used;
   update_extent_pos(jamBuffer(),
                     fragPtrP,
                     extentPtr,
