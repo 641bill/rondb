@@ -23,6 +23,7 @@
 #include "buffer_manager.hpp"
 #include "pk_data_structs.hpp"
 #include "constants.hpp"
+#include "statistics.hpp"
 
 #include <cstring>
 #include <drogon/HttpTypes.h>
@@ -32,6 +33,8 @@
 
 void BatchPKReadCtrl::batchPKRead(const drogon::HttpRequestPtr &req,
                                   std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
+  auto startTime = std::chrono::high_resolution_clock::now();
+
   size_t currentThreadIndex = drogon::app().getCurrentThreadIndex();
   if (currentThreadIndex >= globalConfigs.rest.numThreads) {
     auto resp = drogon::HttpResponse::newHttpResponse();
@@ -53,6 +56,8 @@ void BatchPKReadCtrl::batchPKRead(const drogon::HttpRequestPtr &req,
 
   memcpy(jsonParser.get_buffer(currentThreadIndex).get(), json_str, length);
 
+  auto preParseTime = std::chrono::high_resolution_clock::now();
+
   auto resp = drogon::HttpResponse::newHttpResponse();
   std::vector<PKReadParams> reqStructs;
 
@@ -61,6 +66,8 @@ void BatchPKReadCtrl::batchPKRead(const drogon::HttpRequestPtr &req,
       simdjson::padded_string_view(jsonParser.get_buffer(currentThreadIndex).get(), length,
                                    REQ_BUFFER_SIZE + simdjson::SIMDJSON_PADDING),
       reqStructs);
+
+  auto postParseTime = std::chrono::high_resolution_clock::now();
 
   if (static_cast<drogon::HttpStatusCode>(status.http_code) != drogon::HttpStatusCode::k200OK) {
     resp->setBody(std::string(status.message));
@@ -77,6 +84,8 @@ void BatchPKReadCtrl::batchPKRead(const drogon::HttpRequestPtr &req,
     return;
   }
 
+  auto preValidationTime = std::chrono::high_resolution_clock::now();
+
   for (auto reqStruct : reqStructs) {
     status = reqStruct.validate();
     if (static_cast<drogon::HttpStatusCode>(status.http_code) != drogon::HttpStatusCode::k200OK) {
@@ -87,7 +96,11 @@ void BatchPKReadCtrl::batchPKRead(const drogon::HttpRequestPtr &req,
     }
   }
 
+  auto postValidationTime = std::chrono::high_resolution_clock::now();
+
   if (static_cast<drogon::HttpStatusCode>(status.http_code) == drogon::HttpStatusCode::k200OK) {
+    auto preRequestTime = std::chrono::high_resolution_clock::now();
+
     auto noOps = reqStructs.size();
     std::vector<RS_Buffer> reqBuffs(noOps);
     std::vector<RS_Buffer> respBuffs(noOps);
@@ -112,8 +125,12 @@ void BatchPKReadCtrl::batchPKRead(const drogon::HttpRequestPtr &req,
       reqBuffs[i].size            = *length_ptr_casted;
     }
 
+    auto postRequestTime = std::chrono::high_resolution_clock::now();
+
     // pk_batch_read
     status = pk_batch_read(noOps, reqBuffs.data(), respBuffs.data());
+
+    auto postBatchReadTime = std::chrono::high_resolution_clock::now();
 
     resp->setStatusCode(static_cast<drogon::HttpStatusCode>(status.http_code));
 
@@ -137,5 +154,15 @@ void BatchPKReadCtrl::batchPKRead(const drogon::HttpRequestPtr &req,
       rsBufferArrayManager.return_resp_buffer(respBuffs[i]);
       rsBufferArrayManager.return_req_buffer(reqBuffs[i]);
     }
+
+    auto endTime = std::chrono::high_resolution_clock::now();
+    // Update global statistics
+    timingStatistics.update(std::chrono::duration_cast<std::chrono::microseconds>(preParseTime - startTime),
+                        std::chrono::duration_cast<std::chrono::microseconds>(postParseTime - preParseTime),
+                        std::chrono::duration_cast<std::chrono::microseconds>(postValidationTime - preValidationTime),
+                        std::chrono::duration_cast<std::chrono::microseconds>(postRequestTime - preRequestTime),
+                        std::chrono::duration_cast<std::chrono::microseconds>(postBatchReadTime - postRequestTime),
+                        std::chrono::duration_cast<std::chrono::microseconds>(endTime - postBatchReadTime),
+                        std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime));
   }
 }
