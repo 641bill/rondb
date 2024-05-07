@@ -58,6 +58,11 @@ add_executable(
   feature_store_test.cpp
 )
 
+add_executable(
+  reconnection_test
+  reconnection_test.cpp
+)
+
 target_link_libraries(
 	api_key_test
 	gtest_main
@@ -67,7 +72,7 @@ target_link_libraries(
 	simdjson::simdjson
 	Jsoncpp_lib
 	pthread
-        ndbgeneral
+  ndbgeneral
 )
 
 target_link_libraries(
@@ -80,6 +85,17 @@ target_link_libraries(
   simdjson::simdjson
   Jsoncpp_lib
   pthread
+)
+
+target_link_libraries(
+	reconnection_test
+	gtest_main
+	rdrs2_lib
+	${GTEST_LIBRARIES}
+	Drogon::Drogon
+	simdjson::simdjson
+	Jsoncpp_lib
+	pthread
 )
 
 set(RESOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/resources")

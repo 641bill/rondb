@@ -92,6 +92,8 @@ constexpr const char *FEATURE_STORE_OPERATION  = "feature_store";
 constexpr const char *SEQUENCE_SEPARATOR       = "#";
 
 constexpr const char *ERROR_NOT_FOUND = "Not Found";
+constexpr const char *CONTENT_TYPE                   = "Content-Type";
+constexpr const char *APPLICATION_JSON               = "application/json";
 
 const int RESP_BUFFER_SIZE                 = 5 * 1024 * 1024;
 const int REQ_BUFFER_SIZE                  = 1024 * 1024;

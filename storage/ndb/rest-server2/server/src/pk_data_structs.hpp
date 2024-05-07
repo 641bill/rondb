@@ -77,6 +77,13 @@ class PKReadParams {
   RS_Status validate();
 };
 
+class PKReadBody {
+public:
+  std::vector<PKReadFilter> filters;
+  std::vector<PKReadReadColumn> readColumns;
+  std::string operationId;
+};
+
 struct Column {
   std::string name;
   std::vector<char> value;  // Byte array for the value

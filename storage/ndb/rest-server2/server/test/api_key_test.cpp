@@ -25,40 +25,14 @@
 #include "rdrs_hopsworks_dal.h"
 #include "rdrs_rondb_connection.hpp"
 #include "rdrs_rondb_connection_pool.hpp"
+#include "util.hpp"
 
 #include <gtest/gtest.h>
 #include <iostream>
 #include <memory>
 #include <chrono>
-#include <queue>
-#include <mutex>
-#include <condition_variable>
-
-template <typename T> class SafeQueue {
- private:
-  std::queue<T> queue_;
-  std::mutex mutex_;
-  std::condition_variable cond_;
-
- public:
-  void push(T value) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    queue_.push(std::move(value));
-    cond_.notify_one();
-  }
-
-  T pop() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    cond_.wait(lock, [this] { return !queue_.empty(); });
-    T value = std::move(queue_.front());
-    queue_.pop();
-    return value;
-  }
-};
 
 extern RDRSRonDBConnectionPool *rdrsRonDBConnectionPool;
-const std::string HOPSWORKS_TEST_API_KEY =
-    "bkYjEz6OTZyevbqt.ocHajJhnE0ytBh8zbYj3IXupyMqeMZp8PW464eTxzxqP5afBjodEQUgY0lmL33ub";
 
 class APIKeyTest : public ::testing::Test {
  protected:
